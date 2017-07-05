@@ -72,6 +72,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.apache.directory.kerberos.client.*;
+import org.apache.directory.shared.kerberos.codec.types.EncryptionType;
+import org.apache.directory.server.kerberos.changepwd.exceptions.ChangePasswordException;
+
+import java.io.*;
+
+
 /**
  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
@@ -565,10 +572,27 @@ public class LDAPStorageProvider implements UserStorageProvider,
 
     @Override
     public boolean updateCredential(RealmModel realm, UserModel user, CredentialInput input) {
-        if (!CredentialModel.PASSWORD.equals(input.getType()) || ! (input instanceof PasswordUserCredentialModel)) return false;
-        if (editMode == UserStorageProvider.EditMode.READ_ONLY) {
-            throw new ReadOnlyException("Federated storage is not writable");
-
+	if (editMode == UserStorageProvider.EditMode.READ_ONLY || (editMode == UserStorageProvider.EditMode.WRITABLE && kerberosConfig.isAllowKerberosAuthentication() && kerberosConfig.isUseKerberosForPasswordChange())) {
+		if (kerberosConfig.isAllowKerberosAuthentication() && kerberosConfig.isUseKerberosForPasswordChange()){
+			if (!CredentialModel.PASSWORD.equals(input.getType()) || ! (input instanceof PasswordUserCredentialModel)) return false;
+                        PasswordUserCredentialModel cred1 = (PasswordUserCredentialModel)input;
+                        String oldPassword = (String)cred1.getNote("oldPassword");
+                        String newPassword = cred1.getValue();
+			String userPrincipal = user.getUsername() + "@" + kerberosConfig.getKerberosRealm();
+				if(oldPassword == null || oldPassword == "")
+				{
+					return resetPassword(userPrincipal, newPassword);
+				}
+				else
+				{
+					return customChangePassword(userPrincipal, oldPassword, newPassword);
+				}
+  
+		}
+		else
+		{
+			throw new ReadOnlyException("Federated storage is not writable");
+		}
         } else if (editMode == UserStorageProvider.EditMode.WRITABLE) {
             LDAPIdentityStore ldapIdentityStore = getLdapIdentityStore();
             PasswordUserCredentialModel cred = (PasswordUserCredentialModel)input;
@@ -730,5 +754,113 @@ public class LDAPStorageProvider implements UserStorageProvider,
         return ldapUser;
     }
 
+    /**
+     * * Called to change the user password
+     * *
+     * * @param userPrincipal Kerberos principal name of the user
+     * * @param userPassword The old user password
+     * * @param newPassword The user's new password
+     * * @return true or false if the operation was successful
+     * * 
+     * */
+    public boolean customChangePassword(String userPrincipal, String userPassword, String newPassword)
+    {
+	KdcConfig config = KdcConfig.getDefaultConfig();
+	System.out.println("KDC = " + kerberosConfig.getKerberosKDCHostname());
+	config.setHostName(kerberosConfig.getKerberosKDCHostname());
+	config.setUseUdp(true);
+	config.setKdcPort(750);
+	config.setUseLegacyChngPwdProtocol(true);
 
+        Set<EncryptionType> enct = new HashSet<EncryptionType>();
+        //enct.add(EncryptionType.AES256_CTS_HMAC_SHA1_96);
+        //enct.add(EncryptionType.DES_CBC_CRC);
+        //config.setEncryptionTypes(enct);
+ 
+	KdcConnection conn = new KdcConnection(config);
+	try {
+		//conn.getTgt(userPrincipal, userPassword);
+		ChangePasswordResult res = conn.changePassword(userPrincipal, userPassword, newPassword);
+		if (res.getCode().compareTo(ChangePasswordResultCode.KRB5_KPASSWD_SUCCESS) == 0  ) {
+			System.out.println("Password was changed!");
+			return true;
+		} else {
+			System.out.println("Password change error - " + res.getCode().name());
+			throw new ModelException(res.getMessage());
+		}
+	}catch(Exception e)
+	{
+		e.printStackTrace();
+                throw new ModelException(e.getMessage());
+	}
+  
+    }
+
+    /**
+     * * Called to reset the principal password
+     * *
+     * * @param userPrincipal Kerberos principal name of the user
+     * * @param newPassword The user's new password
+     * * @return true or false if the operation was successful
+     * * 
+     * */
+    public boolean resetPassword(String userPrincipal,String newPassword)
+    {
+	String passwdAdminUser = kerberosConfig.getKerberosPasswdAdminUser();
+	String passwdAdminPasswd = kerberosConfig.getKerberosPasswdAdminPasswd();
+	
+	if(passwdAdminUser == "" || passwdAdminPasswd == "")
+	{
+		throw new ModelException("Password Admin Credentials are Missing");
+	}
+	passwdAdminUser = passwdAdminUser + "@" + kerberosConfig.getKerberosRealm();     
+  
+	String[] commands = {"kadmin", "-p", passwdAdminUser, "-w", passwdAdminPasswd ,   "-q", "change_password -pw " + newPassword + " " + userPrincipal};
+	String errorMessage = "Password change failed";
+	boolean passwordChanged = false;
+	
+	try {
+		ProcessBuilder pb = new ProcessBuilder(commands);
+		pb.redirectErrorStream(true);
+		
+		/* Start the process */
+		Process proc = pb.start();
+		System.out.println("Process started !");
+
+		/* Read the process's output */
+		String line;
+		BufferedReader in = new BufferedReader(new InputStreamReader(
+		proc.getInputStream()));
+                while ((line = in.readLine()) != null) {
+                	System.out.println(line);
+                        if(line.startsWith("change_password:"))
+                        {
+                        	errorMessage = line.substring(17);
+                        }
+                        else if(line.startsWith("kadmin"))
+                        {
+                        	errorMessage = line.substring(7);
+                        }
+                        else if(line.startsWith("Password for") && line.endsWith("chang  ed."))
+                        {
+                        	passwordChanged = true;
+                        }
+               	}
+                proc.destroy();
+                if(!passwordChanged)
+                {
+                	System.out.println("Password Change Failed : " + errorMessage);
+			throw new ModelException(errorMessage);
+		}
+		else
+		{
+			System.out.println("Password Change Success");
+			return true;
+		}
+	}catch(Exception e)
+	{
+		e.printStackTrace();
+		throw new ModelException(e.getMessage());
+	}
+    }
 }
